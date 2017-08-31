@@ -10,6 +10,7 @@ from requests.packages.urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from cachetools import LFUCache
 from timeit import default_timer
+from queue import Empty
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ def wh_updater():
     frame_interval_sec = (args.wh_frame_interval / 1000)
     frame_first_message_time_sec = default_timer()
     frame_messages = []
+    first_message = True
 
     # How low do we want the queue size to stay?
     wh_warning_threshold = 100
@@ -86,58 +88,61 @@ def wh_updater():
     while True:
         try:
             # Loop the queue.
-            whtype, message = wh_queue.get()
+            try:
+                timeout = frame_interval_sec if len(
+                    frame_messages) > 0 else None
+                whtype, message = wh_queue.get(True, timeout)
+            except Empty:
+                pass
+            else:
+                frame_message = {'type': whtype, 'message': message}
 
-            frame_message = {
-                'type': whtype,
-                'message': message
-            }
+                # Get the proper cache if this type has one.
+                key_cache = None
 
-            # Get the proper cache if this type has one.
-            key_cache = None
+                if whtype in key_caches:
+                    key_cache = key_caches[whtype]
 
-            if whtype in key_caches:
-                key_cache = key_caches[whtype]
+                # Get the unique identifier to check our cache, if it has one.
+                ident = message.get(ident_fields.get(whtype), None)
 
-            # Get the unique identifier to check our cache, if it has one.
-            ident = message.get(ident_fields.get(whtype), None)
-
-            # cachetools in Python2.7 isn't thread safe, so we add a lock.
-            with wh_lock:
-                # Only send if identifier isn't already in cache.
-                if ident is None or key_cache is None:
-                    # We don't know what it is, or it doesn't have a cache,
-                    # so let's just log and send as-is.
-                    log.debug(
-                        'Queued webhook item of uncached type: %s.', whtype)
-                    frame_messages.append(frame_message)
-                elif ident not in key_cache:
-                    key_cache[ident] = message
-                    log.debug('Queued %s to webhook: %s.', whtype, ident)
-                    frame_messages.append(frame_message)
-                else:
-                    # Make sure to call key_cache[ident] in all branches so it
-                    # updates the LFU usage count.
-
-                    # If the object has changed in an important way, send new
-                    # data to webhooks.
-                    if __wh_object_changed(whtype, key_cache[ident], message):
-                        key_cache[ident] = message
+                # cachetools in Python2.7 isn't thread safe, so we add a lock.
+                with wh_lock:
+                    # Only send if identifier isn't already in cache.
+                    if ident is None or key_cache is None:
+                        # We don't know what it is, or it doesn't have a cache,
+                        # so let's just log and send as-is.
+                        log.debug('Queued webhook item of uncached type: %s.',
+                                  whtype)
                         frame_messages.append(frame_message)
-                        log.debug('Queued updated %s to webhook: %s.',
-                                  whtype, ident)
+                    elif ident not in key_cache:
+                        key_cache[ident] = message
+                        log.debug('Queued %s to webhook: %s.', whtype, ident)
+                        frame_messages.append(frame_message)
                     else:
-                        log.debug('Not queing %s to webhook: %s.',
-                                  whtype, ident)
-
+                        # Make sure to call key_cache[ident] in all branches
+                        # so it updates the LFU usage count.
+                        # If the object has changed in an important way, send
+                        # new data to webhooks.
+                        if __wh_object_changed(whtype, key_cache[ident],
+                                               message):
+                            key_cache[ident] = message
+                            frame_messages.append(frame_message)
+                            log.debug('Queued updated %s to webhook: %s.',
+                                      whtype, ident)
+                        else:
+                            log.debug('Not queing %s to webhook: %s.',
+                                      whtype, ident)
+                wh_queue.task_done()
             # Store the time when we added the first message instead of the
             # time when we last cleared the messages, so we more accurately
             # measure time spent getting messages from our queue.
             now = default_timer()
             num_messages = len(frame_messages)
 
-            if num_messages == 1:
+            if num_messages == 1 and first_message:
                 frame_first_message_time_sec = now
+                first_message = False
 
             # If enough time has passed, send the message frame.
             time_passed_sec = now - frame_first_message_time_sec
@@ -150,6 +155,7 @@ def wh_updater():
                 send_to_webhooks(args, session, frame_messages)
 
                 frame_messages = []
+                first_message = True
 
             if wh_queue.qsize() > max_queue_size:
                 max_queue_size = wh_queue.qsize()
@@ -176,7 +182,6 @@ def wh_updater():
                                     wh_queue.qsize(),
                                     wh_threshold_lifetime)
 
-            wh_queue.task_done()
         except Exception as e:
             log.exception('Exception in wh_updater: %s.', repr(e))
 
